@@ -80,15 +80,19 @@ contract ModaMintToken is IERC20, Ownable {
     mapping(address => uint256) private _balances;
     mapping(address => mapping(address => uint256)) private _allowances;
 
-    // ===== 分红系统（BNB 直发模式）=====
+    // ===== 分红系统（修复版 Shareholder 模型）=====
     uint256 public dividendsPerShare;
     uint256 public totalDividendDistributed;
     uint256 public _availableDivFunds;
-    mapping(address => int256) public magnifiedDividendCorrections;
     uint256 public minHoldForDividend;
     uint256 public dividendCooldown = 100;
     uint256 public lastDividendBlock;
     uint256 public dividendBps;
+    uint256 public minDividendAmount = 1e14;
+
+    mapping(address => uint256) public totalExcluded;
+    mapping(address => uint256) public totalRealised;
+    mapping(address => bool) public isDividendExempt;
 
     // ===== 税费系统 =====
     uint256 public buyTaxBps;
@@ -197,6 +201,10 @@ contract ModaMintToken is IERC20, Ownable {
         presaleActive = true;
         tradingActive = false;
 
+        isDividendExempt[address(this)] = true;
+        isDividendExempt[address(0)] = true;
+
+
         mintCostBNB = mintCostBNB_;
         fillAmountBNB = fillBNB_;
         tokensPerMint = _totalSupply.mul(presaleTokenPct_).div(100).div(fillBNB_.div(mintCostBNB_));
@@ -249,7 +257,7 @@ contract ModaMintToken is IERC20, Ownable {
         require(_balances[from] >= amount, "Insufficient balance");
 
         // 在 DEX 交易开始时触发分红 swap（仅卖出/转帐时，买入时 Pair 锁定不可重入）
-        if (from != uniswapV2Pair) {
+        if (!inSwap) {
             _tryAutoSwap();
         }
 
@@ -270,20 +278,26 @@ contract ModaMintToken is IERC20, Ownable {
 
         uint256 sendAmt = amount.sub(taxAmount);
 
-        // ✅ 自动派发分红（push 模式）
+        _balances[from] = _balances[from].sub(amount);
+        _balances[to] = _balances[to].add(sendAmt);
+
+        if (!isDividendExempt[from]) {
+            totalExcluded[from] = cumulativeDividend(
+                _balances[from]
+            );
+        }
+
+        if (!isDividendExempt[to]) {
+            totalExcluded[to] = cumulativeDividend(
+                _balances[to]
+            );
+        }
+
+        // 自动派发分红
         if (dividendBps > 0) {
             _autoClaimDividend(from);
             _autoClaimDividend(to);
         }
-
-        // 分红修正值更新（用 sendAmt 而不是 amount，因为 to 只收到 sendAmt）
-        if (dividendBps > 0 && dividendsPerShare > 0) {
-            magnifiedDividendCorrections[from] += int256(amount) * int256(dividendsPerShare);
-            magnifiedDividendCorrections[to]   -= int256(sendAmt) * int256(dividendsPerShare);
-        }
-
-        _balances[from] = _balances[from].sub(amount);
-        _balances[to] = _balances[to].add(sendAmt);
 
         if (taxAmount > 0) {
             _balances[address(this)] = _balances[address(this)].add(taxAmount);
@@ -319,54 +333,62 @@ contract ModaMintToken is IERC20, Ownable {
 
     // ===== 分红系统 =====
     function _autoClaimDividend(address account) internal {
-        if (dividendBps == 0 || dividendsPerShare == 0) return;
-        if (account == uniswapV2Pair || account == address(this) || account == address(0)) return;
-        if (_balances[account] < minHoldForDividend) return;
+        if (isDividendExempt[account]) return;
 
-        int256 mag = int256(_balances[account]) * int256(dividendsPerShare)
-                     + magnifiedDividendCorrections[account];
-        if (mag <= 0) return;
+        uint256 pending = getPendingDividend(account);
 
-        uint256 pending = uint256(mag) / DIVIDEND_PRECISION;
-        if (pending == 0) return;
-        if (pending > _availableDivFunds) return;
+        if (pending < minDividendAmount) return;
+        if (address(this).balance < pending) return;
 
-        _availableDivFunds = _availableDivFunds.sub(pending);
-        magnifiedDividendCorrections[account] = -int256(_balances[account]) * int256(dividendsPerShare);
+        totalRealised[account] += pending;
 
-        (bool success, ) = account.call{value: pending}("");
-        if (!success) {
-            // 如果转账失败（如合约钱包拒绝接收 BNB），恢复状态
-            _availableDivFunds = _availableDivFunds.add(pending);
-            magnifiedDividendCorrections[account] = magnifiedDividendCorrections[account]
-                + int256(pending * DIVIDEND_PRECISION);
+        totalExcluded[account] = cumulativeDividend(
+            _balances[account]
+        );
+
+        _availableDivFunds = _availableDivFunds >= pending
+            ? _availableDivFunds - pending
+            : 0;
+
+        (bool success, ) = payable(account).call{value: pending}("");
+        if (success) {
+            emit DividendClaimed(account, address(0), pending);
         }
+    }
         emit DividendClaimed(account, address(0), pending);
     }
 
+    
+    function circulatingSupply() public view returns (uint256) {
+        return _totalSupply
+            - _balances[address(this)]
+            - _balances[uniswapV2Pair]
+            - _balances[address(0)];
+    }
+
+    function cumulativeDividend(uint256 share) internal view returns (uint256) {
+        return share * dividendsPerShare / DIVIDEND_PRECISION;
+    }
+
     function getPendingDividend(address account) public view returns (uint256) {
-        if (_balances[account] == 0 || dividendBps == 0) return 0;
+        if (isDividendExempt[account]) return 0;
         if (_balances[account] < minHoldForDividend) return 0;
-        int256 mag = int256(_balances[account]) * int256(dividendsPerShare)
-                     + magnifiedDividendCorrections[account];
-        if (mag <= 0) return 0;
-        return uint256(mag) / DIVIDEND_PRECISION;
+
+        uint256 shareholderTotalDividends = cumulativeDividend(
+            _balances[account]
+        );
+
+        uint256 shareholderTotalExcluded = totalExcluded[account];
+
+        if (shareholderTotalDividends <= shareholderTotalExcluded) {
+            return 0;
+        }
+
+        return shareholderTotalDividends - shareholderTotalExcluded;
     }
 
     function claimDividend() external {
-        _tryAutoSwap();
-        uint256 pending = getPendingDividend(msg.sender);
-        require(pending > 0, "Nothing to claim");
-        require(_balances[msg.sender] >= minHoldForDividend, "Below min hold");
-        require(pending <= _availableDivFunds, "Insufficient dividend funds");
-
-        _availableDivFunds = _availableDivFunds.sub(pending);
-        magnifiedDividendCorrections[msg.sender] = magnifiedDividendCorrections[msg.sender]
-            - int256(pending * DIVIDEND_PRECISION);
-
-        (bool success, ) = msg.sender.call{value: pending}("");
-        require(success, "BNB transfer failed");
-        emit DividendClaimed(msg.sender, address(0), pending);
+        _autoClaimDividend(msg.sender);
     }
 
     /// @notice 手动触发分红 swap
@@ -439,9 +461,16 @@ contract ModaMintToken is IERC20, Ownable {
         if (divBNB > 0) {
             uint256 ts = _totalSupply;
             if (ts > 0) {
-                dividendsPerShare = dividendsPerShare.add(
-                    divBNB.mul(DIVIDEND_PRECISION).div(ts)
+                if (divBNB > 0) {
+            uint256 supply = circulatingSupply();
+            if (supply > 0) {
+                dividendsPerShare += (
+                    divBNB * DIVIDEND_PRECISION / supply
                 );
+                totalDividendDistributed += divBNB;
+                _availableDivFunds += divBNB;
+            }
+        }
                 totalDividendDistributed = totalDividendDistributed.add(divBNB);
                 _availableDivFunds = _availableDivFunds.add(divBNB);
             }
