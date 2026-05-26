@@ -347,8 +347,7 @@ contract ModaMintToken is IERC20, Ownable {
         if (isDividendExempt[account]) return;
 
         uint256 pending = getPendingDividend(account);
-
-        if (pending < minDividendAmount) return;
+        if (pending == 0) return;
         if (address(this).balance < pending) return;
 
         totalRealised[account] += pending;
