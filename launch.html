@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>莫大 MODA MINT — 41发射代币</title>
+  <title>莫大 MODA MINT — 4发射代币</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -953,6 +953,15 @@
             <button onclick="adminCheckWhitelist()" style="background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:600;box-shadow:0 2px 8px rgba(37,99,235,.35)">🔍 查询</button>
             <span id="wl-check-result" style="font-size:.78rem;color:var(--text-muted)"></span>
           </div>
+        </div>
+        <hr style="border:none;border-top:1px solid rgba(255,255,255,.08);margin:12px 0"/>
+        <!-- 丢弃权限 -->
+        <div style="margin-bottom:6px">
+          <div style="font-size:.8rem;color:var(--danger);margin-bottom:6px;font-weight:600">⚠️ 危险操作</div>
+          <div style="font-size:.75rem;color:var(--text-muted);margin-bottom:8px">丢弃 Owner 权限后，合约将永久无法再调用管理员函数（税费、分红、提取 BNB 等）。此操作不可撤销！</div>
+          <button onclick="adminRenounceOwnership()" style="background:linear-gradient(135deg,#dc2626,#991b1b);color:#fff;border:none;padding:10px 22px;border-radius:8px;font-size:.85rem;cursor:pointer;font-weight:600;box-shadow:0 2px 8px rgba(220,38,38,.4)">
+            🚨 丢弃 Owner 权限（不可撤销）
+          </button>
         </div>
         <hr style="border:none;border-top:1px solid rgba(255,255,255,.08);margin:12px 0"/>
         <!-- Mint 测试 -->
@@ -2448,6 +2457,45 @@ async function adminCheckWhitelist() {
       : '<span style="color:#f87171">❌ 不在白名单中</span>';
   } catch(e) {
     resultSpan.innerHTML = '<span style="color:#f87171">查询失败</span>';
+  }
+}
+
+/* 丢弃 Owner 权限（不可撤销） */
+async function adminRenounceOwnership() {
+  if (!_adminContractAddr) { adminLog('请先连接合约', true); return; }
+  if (!signer) { adminLog('请先连接钱包', true); return; }
+  const token = new ethers.Contract(_adminContractAddr, window.__ABI, signer);
+  const owner = await token.owner();
+  if (owner.toLowerCase() !== currentAccount.toLowerCase()) {
+    adminLog('当前钱包不是 Owner，无法操作', true);
+    return;
+  }
+  const confirmed = confirm(
+    '⚠️ 确认丢弃 Owner 权限？\n\n' +
+    '丢弃后，以下管理员功能将永久失效：\n' +
+    '- 修改税费\n' +
+    '- 修改分红设置\n' +
+    '- 提取 BNB\n' +
+    '- 白名单管理\n' +
+    '- 结束预售 / 开启交易\n' +
+    '- 提取代币\n\n' +
+    '此操作不可撤销！'
+  );
+  if (!confirmed) { adminLog('已取消'); return; }
+
+  try {
+    adminLog('提交丢弃权限交易...');
+    const tx = await token.renounceOwnership({ gasLimit: 80000 });
+    adminLog('交易已提交，等待确认... Tx: ' + tx.hash);
+    const receipt = await tx.wait(1);
+    if (receipt.status === 1) {
+      adminLog('✅ Owner 权限已丢弃！合约现在完全去中心化。', false);
+      adminRefreshStatus();
+    } else {
+      adminLog('❌ 交易失败（reverted）', true);
+    }
+  } catch (e) {
+    adminLog('❌ 交易失败: ' + (e.reason || e.message || e), true);
   }
 }
 
